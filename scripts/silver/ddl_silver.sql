@@ -4,32 +4,45 @@ DDL Script: Silver Layer — Cleaned & Standardised Tables
 ===============================================================================
 Purpose:
     Transforms raw Bronze data into cleaned, typed, deduplicated Silver tables.
-    Stored as Athena CTAS (CREATE TABLE AS SELECT) in S3.
+    Stored as Athena CTAS using external_location — writes Parquet files
+    directly to dedicated S3 paths under silver/.
 
 Transformations applied:
     - Null handling and default values
     - String trimming and standardisation (gender, marital status, country)
     - Date parsing from integer format (YYYYMMDD → DATE)
-    - Deduplication via ROW_NUMBER() window function
+    - Deduplication via ROW_NUMBER() window function (wrapped in subquery)
     - Sales amount validation (quantity × price consistency)
-    - Product lifecycle tracking via LEAD() window function
+    - Product lifecycle tracking via LEAD() window function (wrapped in subquery)
+
+Notes:
+    - Uses external_location instead of location (required for Hive-style tables in Athena)
+    - Uses format = 'PARQUET' for columnar storage — faster queries, lower scan cost
+    - Window function aliases must be resolved in a subquery before being referenced
+      in WHERE or outer SELECT — Athena requirement
 
 Run Order:
-    Run bronze/ddl_bronze.sql first, then run each section below in order.
+    1. Set Athena editor database to 'silver' before running
+    2. Run bronze/ddl_bronze.sql first
+    3. Run each section below in order
 ===============================================================================
 */
 
-CREATE SCHEMA silver;
+CREATE SCHEMA IF NOT EXISTS silver;
 
 
 -- ============================================================
 -- silver.cust_info — CRM Customer Master
 -- ============================================================
--- Deduplicates by cst_id (keep latest), trims strings,
--- standardises gender and marital status codes to readable values.
+-- Deduplicates by cst_id (keep latest record via ROW_NUMBER),
+-- trims strings, standardises gender and marital status codes.
 
 DROP TABLE IF EXISTS silver.cust_info;
-CREATE TABLE silver.cust_info AS
+CREATE TABLE silver.cust_info
+WITH (
+    external_location = 's3://sneha-datawarehouse-project/silver/cust_info/',
+    format = 'PARQUET'
+) AS
 SELECT
     cst_id,
     cst_key,
@@ -42,8 +55,8 @@ FROM (
     SELECT
         cst_id,
         cst_key,
-        TRIM(cst_firstname)    AS cst_firstname,
-        TRIM(cst_lastname)     AS cst_lastname,
+        TRIM(cst_firstname) AS cst_firstname,
+        TRIM(cst_lastname)  AS cst_lastname,
         CASE
             WHEN UPPER(TRIM(cst_marital_status)) = 'S' THEN 'Single'
             WHEN UPPER(TRIM(cst_marital_status)) = 'M' THEN 'Married'
@@ -68,31 +81,47 @@ WHERE rn = 1;
 -- silver.prd_info — CRM Product Master
 -- ============================================================
 -- Extracts category ID from product key, decodes product line codes,
--- derives product end dates using LEAD() for SCD tracking.
+-- derives product end dates using LEAD() for SCD Type 2 tracking.
+-- Wrapped in subquery so window function aliases resolve correctly.
 
 DROP TABLE IF EXISTS silver.prd_info;
-CREATE TABLE silver.prd_info AS
+CREATE TABLE silver.prd_info
+WITH (
+    external_location = 's3://sneha-datawarehouse-project/silver/prd_info/',
+    format = 'PARQUET'
+) AS
 SELECT
     prd_id,
-    REPLACE(SUBSTRING(prd_key, 1, 5), '-', '_')  AS cat_id,
-    SUBSTRING(prd_key, 7)                          AS prd_key,
+    cat_id,
+    prd_key,
     prd_nm,
-    COALESCE(prd_cost, 0)                          AS prd_cost,
-    CASE
-        WHEN UPPER(TRIM(prd_line)) = 'M' THEN 'Mountain'
-        WHEN UPPER(TRIM(prd_line)) = 'R' THEN 'Road'
-        WHEN UPPER(TRIM(prd_line)) = 'S' THEN 'Other Sales'
-        WHEN UPPER(TRIM(prd_line)) = 'T' THEN 'Touring'
-        ELSE 'n/a'
-    END AS prd_line,
-    CAST(prd_start_dt AS DATE) AS prd_start_dt,
-    CAST(
-        DATE_ADD('day', -1,
-            LEAD(CAST(prd_start_dt AS DATE))
-            OVER (PARTITION BY prd_key ORDER BY prd_start_dt)
-        ) AS DATE
-    ) AS prd_end_dt
-FROM datawarehouse.prd_info;
+    prd_cost,
+    prd_line,
+    prd_start_dt,
+    prd_end_dt
+FROM (
+    SELECT
+        prd_id,
+        REPLACE(SUBSTRING(prd_key, 1, 5), '-', '_') AS cat_id,
+        SUBSTRING(prd_key, 7)                         AS prd_key,
+        prd_nm,
+        COALESCE(prd_cost, 0)                         AS prd_cost,
+        CASE
+            WHEN UPPER(TRIM(prd_line)) = 'M' THEN 'Mountain'
+            WHEN UPPER(TRIM(prd_line)) = 'R' THEN 'Road'
+            WHEN UPPER(TRIM(prd_line)) = 'S' THEN 'Other Sales'
+            WHEN UPPER(TRIM(prd_line)) = 'T' THEN 'Touring'
+            ELSE 'n/a'
+        END AS prd_line,
+        CAST(prd_start_dt AS DATE) AS prd_start_dt,
+        CAST(
+            DATE_ADD('day', -1,
+                LEAD(CAST(prd_start_dt AS DATE))
+                OVER (PARTITION BY prd_key ORDER BY prd_start_dt)
+            ) AS DATE
+        ) AS prd_end_dt
+    FROM datawarehouse.prd_info
+);
 
 
 -- ============================================================
@@ -102,7 +131,11 @@ FROM datawarehouse.prd_info;
 -- recalculates sales amount where quantity × price is inconsistent.
 
 DROP TABLE IF EXISTS silver.sales_details;
-CREATE TABLE silver.sales_details AS
+CREATE TABLE silver.sales_details
+WITH (
+    external_location = 's3://sneha-datawarehouse-project/silver/sales_details/',
+    format = 'PARQUET'
+) AS
 SELECT
     sls_ord_num,
     sls_prd_key,
@@ -141,7 +174,11 @@ FROM datawarehouse.sales_details;
 -- nullifies future birthdates, standardises gender values.
 
 DROP TABLE IF EXISTS silver.cust_az12;
-CREATE TABLE silver.cust_az12 AS
+CREATE TABLE silver.cust_az12
+WITH (
+    external_location = 's3://sneha-datawarehouse-project/silver/cust_az12/',
+    format = 'PARQUET'
+) AS
 SELECT
     CASE
         WHEN cid LIKE 'NAS%' THEN SUBSTRING(cid, 4, LENGTH(cid))
@@ -165,7 +202,11 @@ FROM datawarehouse.cust_az12;
 -- Removes dashes from customer IDs, standardises country names.
 
 DROP TABLE IF EXISTS silver.loc_a101;
-CREATE TABLE silver.loc_a101 AS
+CREATE TABLE silver.loc_a101
+WITH (
+    external_location = 's3://sneha-datawarehouse-project/silver/loc_a101/',
+    format = 'PARQUET'
+) AS
 SELECT
     REPLACE(cid, '-', '') AS cid,
     CASE
@@ -183,7 +224,11 @@ FROM datawarehouse.loc_a101;
 -- Pass-through with schema alignment for Gold layer joins.
 
 DROP TABLE IF EXISTS silver.px_cat_g1v2;
-CREATE TABLE silver.px_cat_g1v2 AS
+CREATE TABLE silver.px_cat_g1v2
+WITH (
+    external_location = 's3://sneha-datawarehouse-project/silver/px_cat_g1v2/',
+    format = 'PARQUET'
+) AS
 SELECT
     id,
     cat,
