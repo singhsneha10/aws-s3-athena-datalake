@@ -17,19 +17,19 @@ Data Sources
   │  External tables via AWS Glue Data Catalog  │
   │  Raw CSVs — no transformations              │
   └─────────────────────────────────────────────┘
-         │  Athena CTAS (CREATE TABLE AS SELECT)
+         │  Athena CTAS with external_location
          ▼
   ┌─────────────────────────────────────────────┐
   │  AWS S3 — silver/                           │
   │  Cleaned & standardised Parquet tables      │
   │  Deduplication, type casting, null handling │
   └─────────────────────────────────────────────┘
-         │  Athena Views
+         │  Athena Views (no S3 storage)
          ▼
   ┌─────────────────────────────────────────────┐
-  │  AWS Athena — gold/                         │
+  │  AWS Athena — gold schema                   │
   │  Star Schema views: dim + fact              │
-  │  Analytics-ready, no storage cost           │
+  │  Analytics-ready, zero storage cost         │
   └─────────────────────────────────────────────┘
          │
          ▼
@@ -51,14 +51,16 @@ s3://sneha-datawarehouse-project/
 │       ├── cust_az12/
 │       ├── loc_a101/
 │       └── category_info/
-├── silver/
-│   ├── cust_info/
-│   ├── prd_info/
-│   ├── sales_details/
-│   ├── cust_az12/
-│   ├── loc_a101/
-│   └── px_cat_g1v2/
-└── gold/             ← views only, no physical storage
+└── silver/
+    ├── cust_info/        ← Parquet files (CTAS output)
+    ├── prd_info/         ← Parquet files (CTAS output)
+    ├── sales_details/    ← Parquet files (CTAS output)
+    ├── cust_az12/        ← Parquet files (CTAS output)
+    ├── loc_a101/         ← Parquet files (CTAS output)
+    └── px_cat_g1v2/      ← Parquet files (CTAS output)
+
+Note: Gold layer does not exist in S3.
+Gold is implemented as Athena views — metadata only, no physical storage.
 ```
 
 ---
@@ -67,12 +69,12 @@ s3://sneha-datawarehouse-project/
 
 | Service | Purpose |
 |---------|---------|
-| AWS S3 | Data lake storage across all three layers |
-| Amazon Athena | Serverless SQL engine for transformations and querying |
-| AWS Glue Data Catalog | Schema registry for Bronze external tables |
-| OpenCSV SerDe | CSV parsing for Bronze external table definitions |
-| Athena CTAS | Materialises Silver layer transformations into S3 |
-| Athena Views | Gold layer Star Schema — zero storage cost |
+| AWS S3 | Data lake storage for Bronze (CSV) and Silver (Parquet) layers |
+| Amazon Athena | Serverless SQL engine for all transformations and querying |
+| AWS Glue Data Catalog | Schema registry for Bronze external table definitions |
+| OpenCSV SerDe | CSV parsing for Bronze external tables |
+| Athena CTAS + external_location | Writes Silver Parquet files to explicit S3 paths |
+| Athena Views | Gold Star Schema — zero storage cost, always up to date |
 
 ---
 
@@ -84,16 +86,17 @@ aws-s3-athena-datalake/
 │   ├── bronze/
 │   │   └── ddl_bronze.sql          # External tables pointing to S3 raw CSVs
 │   ├── silver/
-│   │   └── ddl_silver.sql          # CTAS transformations: clean, type, dedupe
+│   │   └── ddl_silver.sql          # CTAS with external_location + Parquet format
 │   └── gold/
 │       └── ddl_gold.sql            # Star Schema views: dim_customers, dim_products, fact_sales
 │
 ├── tests/
-│   ├── quality_checks_silver.sql   # Null, duplicate, format, range checks
+│   ├── quality_checks_silver.sql   # Null, duplicate, format, range, join checks
 │   └── quality_checks_gold.sql     # Surrogate key uniqueness, referential integrity
 │
 ├── docs/
-│   └── data_catalogue.md           # Column-level data dictionary for Gold layer
+│   ├── data_catalogue.md           # Column-level data dictionary for Gold layer
+│   └── screenshots/                # Athena query results and S3 structure proof
 │
 └── README.md
 ```
@@ -141,45 +144,42 @@ aws-s3-athena-datalake/
 ### Prerequisites
 - AWS account with Athena and S3 access
 - IAM role with `AmazonAthenaFullAccess` and `AmazonS3FullAccess`
-- Athena query results bucket configured
+- Athena query results bucket configured in Athena settings
 
 ### Step 1 — Upload source CSVs to S3
 
-Upload your CRM and ERP CSVs to the corresponding S3 paths shown in the bucket structure above.
+Upload CRM and ERP CSVs to the corresponding S3 paths shown in the bucket structure above.
 
 ### Step 2 — Create Bronze external tables
 
+Set Athena editor database to `datawarehouse`, then run:
 ```sql
--- Run in Athena query editor:
 -- scripts/bronze/ddl_bronze.sql
 ```
-
-This registers external tables pointing to your S3 raw files. No data is moved.
+Registers external tables pointing to raw S3 CSVs. No data is moved or copied.
 
 ### Step 3 — Build Silver layer
 
+Set Athena editor database to `silver`, then run each table in order:
 ```sql
--- Run in Athena query editor:
 -- scripts/silver/ddl_silver.sql
 ```
-
-CTAS queries read from Bronze, apply all transformations, and write clean Parquet files to `s3://.../silver/`.
+CTAS queries with `external_location` read from Bronze, apply all transformations, and write Parquet files to `s3://sneha-datawarehouse-project/silver/`.
 
 ### Step 4 — Create Gold views
 
+Set Athena editor database to `gold`, then run:
 ```sql
--- Run in Athena query editor:
 -- scripts/gold/ddl_gold.sql
 ```
-
-Creates three views (dim_customers, dim_products, fact_sales) over Silver. No data is written to S3.
+Creates three views over Silver. No data is written to S3 — this is expected.
 
 ### Step 5 — Run quality checks
 
 ```sql
 -- After Silver:  tests/quality_checks_silver.sql
 -- After Gold:    tests/quality_checks_gold.sql
--- All queries should return 0 rows.
+-- All duplicate/null checks should return 0 rows.
 ```
 
 ---
@@ -187,22 +187,28 @@ Creates three views (dim_customers, dim_products, fact_sales) over Silver. No da
 ## Key Engineering Decisions
 
 **Why S3 + Athena instead of a traditional database?**
-S3 + Athena is serverless — no cluster to provision, no idle cost. You pay only per query scanned. For batch analytics workloads this is significantly cheaper than running a dedicated database server.
+S3 + Athena is fully serverless — no cluster to provision, no idle compute cost. You pay only per query scanned. For batch analytics workloads this is significantly cheaper than maintaining a dedicated database server.
 
 **Why external tables for Bronze?**
-Bronze data must remain unchanged as the raw source of truth. External tables let Athena read the CSVs directly from S3 without copying or transforming them, preserving the original data.
+Bronze data must remain unchanged as the raw source of truth. External tables let Athena read CSVs directly from S3 without copying or transforming them, preserving the original data exactly as received from source systems.
 
-**Why CTAS for Silver?**
-CTAS (CREATE TABLE AS SELECT) materialises the transformation output as Parquet files in S3. Parquet is columnar, compressed, and much faster to query than raw CSV — reducing both query time and Athena scan costs.
+**Why `external_location` in Silver CTAS?**
+Athena's Hive-style tables require `external_location` instead of `location` to write CTAS output to a specific S3 path. This ensures Silver Parquet files land in clean, predictable S3 locations (`silver/cust_info/`, `silver/prd_info/`, etc.) rather than the default Athena query results bucket.
+
+**Why Parquet for Silver?**
+Parquet is columnar and compressed. Compared to raw CSV, Parquet reduces Athena query scan costs significantly and improves query performance — especially for large datasets with many columns where only a subset is queried at a time.
 
 **Why views for Gold?**
-Gold views always reflect the latest Silver data without an additional load step. Since Athena charges per data scanned (not per query), views add zero overhead — they simply rewrite the query at runtime.
+Gold views always reflect the latest Silver data without a separate load step. Since Athena charges per data scanned (not per query), views add zero cost overhead — they simply rewrite the query at runtime against Silver tables.
 
 **Why surrogate keys via ROW_NUMBER()?**
-Natural keys from source systems can be reused or change meaning over time. Surrogate keys generated by `ROW_NUMBER()` provide stable, system-independent identifiers for dimension-to-fact joins.
+Natural keys from source systems can be reused or change meaning over time. Surrogate keys generated by `ROW_NUMBER()` provide stable, system-independent identifiers for dimension-to-fact joins in the Star Schema.
 
 **Why LEAD() for product end dates?**
-Product history is encoded implicitly in the source — each new row for a product signals the old version ended. `LEAD()` calculates the end date as one day before the next version's start date, enabling accurate SCD Type 2 tracking.
+Product history is encoded implicitly in the source — each new row for a product signals the old version ended. `LEAD()` calculates the end date as one day before the next version's start date, enabling accurate SCD Type 2 tracking without any manual date management.
+
+**Why wrap window functions in subqueries?**
+Athena (Presto SQL) does not allow referencing window function aliases in the same SELECT or WHERE clause they are defined in. Wrapping the window function in a subquery first and referencing the alias in the outer query is the correct Athena pattern.
 
 ---
 
@@ -214,10 +220,11 @@ Product history is encoded implicitly in the source — each new row for a produ
 - Gender, marital status, country standardised to consistent values
 - Integer dates (YYYYMMDD) parsed correctly — invalid dates nullified
 - Sales amount = quantity × price consistency enforced
+- Cross-table join health between cust_info, cust_az12, loc_a101, and prd_info
 
 **Gold layer validates:**
 - Surrogate key uniqueness in both dimension tables
-- No orphaned fact rows (all FKs resolve to a dimension record)
+- No orphaned fact rows (all FKs resolve to a valid dimension record)
 - No NULL measures in fact_sales
 
 ---
